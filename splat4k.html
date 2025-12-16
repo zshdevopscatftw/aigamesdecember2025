@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Inkfield RPG — Single File Prototype</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e0f12;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #ui{position:fixed;inset:0;pointer-events:none}
+  .hud{position:absolute;left:10px;top:10px;color:#eef;pointer-events:none;text-shadow:0 1px 0 #000}
+  .hint{position:absolute;left:10px;bottom:10px;color:#ccd;opacity:.8}
+  .toast{position:absolute;right:10px;top:10px;color:#ffe;pointer-events:none}
+  .bar{width:220px;height:10px;background:#222;border:1px solid #555;margin-top:6px}
+  .fill{height:100%;background:#4af}
+  canvas{display:block;image-rendering:pixelated}
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+<div id="ui">
+  <div class="hud" id="hud">
+    <div><b>Lvl</b> <span id="lvl">1</span> • <b>XP</b> <span id="xp">0</span>/<span id="xpt">100</span> • <b>Gear</b> <span id="gear">Common</span></div>
+    <div class="bar"><div class="fill" id="hpbar"></div></div>
+    <div style="margin-top:4px"><b>Ink</b> <span id="inkpct">100%</span> • <b>Perks</b>: <span id="perks">None</span></div>
+  </div>
+  <div class="hint">
+    WASD move • Mouse aim • LMB = Sprayer • RMB = Roller (hold) • Q = Bomb • E = Perk • R = Palette • Space = Dash (ink swim) • P = Pause
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+/* ============================================================================
+   Inkfield RPG — Single File Prototype (Canvas + JS, no external assets)
+   - Ink = tile alpha field; modifies speed, swim, damage, traversal
+   - Tools: sprayer (flood-fill spray), roller, bombs
+   - Mobs paint back; territory is contested
+   - RPG layer: XP, perks (ink efficiency, swim speed), gear rarity
+   - Procedural sprites, palette swaps, parametric SFX (WebAudio)
+   ========================================================================== */
+
+// ---------- Utilities ----------
+const rand = (a=1,b=0)=>Math.random()*(a-b)+b;
+const irand=(a,b)=>Math.floor(rand(a+1,b));
+const clamp=(v,lo,hi)=>v<lo?lo:v>hi?hi:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const TAU=Math.PI*2;
+const now=()=>performance.now();
+
+// Palette system (player vs enemy)
+const palettes = [
+  {ink:"#41a3ff", inkDark:"#1b4a88", ui:"#7fc3ff", roller:"#a0d2ff"},
+  {ink:"#ff3d6e", inkDark:"#7a1b30", ui:"#ff90ac", roller:"#ffc1d0"},
+  {ink:"#76ff41", inkDark:"#2a7a1b", ui:"#a9ff87", roller:"#caffb6"},
+  {ink:"#ffd441", inkDark:"#7a5e1b", ui:"#ffe482", roller:"#ffefb1"}
+];
+let palIndex = 0;
+
+// ---------- Audio (parametric beeps) ----------
+const AC = new (window.AudioContext||window.webkitAudioContext)();
+function beep({f=440,t=0.06,type="square",gain=0.05,slide=0}={}){
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.setValueAtTime(f,AC.currentTime);
+  if(slide) o.frequency.linearRampToValueAtTime(f+slide, AC.currentTime+t);
+  g.gain.value=gain; g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime+t);
+  o.connect(g).connect(AC.destination); o.start(); o.stop(AC.currentTime+t);
+}
+function thud(){ beep({f:120,t:0.12,type:"sine",gain:0.08}); }
+function spraySound(){ beep({f:700,t:0.04,type:"triangle",gain:0.03,slide:-200}); }
+function bombSound(){ beep({f:60,t:0.2,type:"sawtooth",gain:0.08,slide:-40}); }
+function levelUpSound(){ for(let i=0;i<4;i++) setTimeout(()=>beep({f:440+160*i,t:0.08,type:"square",gain:0.05}),i*80); }
+
+// ---------- World / Ink Field ----------
+const W = 192, H = 108; // logic grid (5x scale to 960x540)
+const SCALE = 5;
+const canvas = document.getElementById('c');
+canvas.width = W*SCALE; canvas.height = H*SCALE;
+const ctx = canvas.getContext('2d');
+
+const TEAM_PLAYER = 1;
+const TEAM_ENEMY = 2;
+
+// Each cell stores {owner: 0|1|2, alpha: 0..1}
+const inkOwner = new Uint8Array(W*H);
+const inkAlpha = new Float32Array(W*H);
+
+function idx(x,y){ return y*W+x; }
+function inb(x,y){ return (x>=0&&y>=0&&x<W&&y<H); }
+
+function paintCircle(cx,cy,r,team,alpha=0.8){
+  const r2=r*r;
+  for(let y=-r; y<=r; y++){
+    for(let x=-r; x<=r; x++){
+      const dx=cx+x, dy=cy+y;
+      if(!inb(dx,dy)) continue;
+      if(x*x+y*y<=r2){
+        const i=idx(dx,dy);
+        inkOwner[i]=team;
+        inkAlpha[i]=clamp(inkAlpha[i]+alpha*(team===TEAM_PLAYER?1:-1), -1, 1);
+      }
+    }
+  }
+}
+function floodSpray(cx,cy,steps,team,spread=8){
+  for(let i=0;i<steps;i++){
+    const ang = rand(TAU);
+    const dist = rand(spread);
+    const x = clamp(Math.round(cx+Math.cos(ang)*dist),0,W-1);
+    const y = clamp(Math.round(cy+Math.sin(ang)*dist),0,H-1);
+    paintCircle(x,y, irand(2,1), team, 0.5);
+  }
+}
+
+function territoryRatio(team){
+  let owned=0;
+  for(let i=0;i<inkOwner.length;i++) if(inkOwner[i]===team && inkAlpha[i]>0) owned++;
+  return owned/(W*H);
+}
+
+// ---------- Procedural Sprites ----------
+function drawBlob(g, x,y, r, col){
+  g.fillStyle = col;
+  g.beginPath(); g.arc(x,y,r,0,TAU); g.fill();
+  // speckles
+  g.globalAlpha=0.2;
+  for(let i=0;i<3;i++){
+    g.beginPath();
+    g.arc(x+rand(r*0.6,-r*0.6), y+rand(r*0.6,-r*0.6), rand(r*0.4, r*0.2), 0, TAU);
+    g.fill();
+  }
+  g.globalAlpha=1;
+}
+
+// ---------- Entities ----------
+const ents = [];
+function addEnt(e){ ents.push(e); return e; }
+
+const keys = {}, mouse={x:0,y:0,down:false, rdown:false};
+addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true; if(e.key===' ') e.preventDefault();});
+addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+canvas.addEventListener('mousemove',e=>{
+  const r=canvas.getBoundingClientRect();
+  mouse.x = Math.floor((e.clientX-r.left)/SCALE);
+  mouse.y = Math.floor((e.clientY-r.top)/SCALE);
+});
+canvas.addEventListener('mousedown',e=>{ if(e.button===0) mouse.down=true; if(e.button===2) mouse.rdown=true; });
+canvas.addEventListener('mouseup',e=>{ if(e.button===0) mouse.down=false; if(e.button===2) mouse.rdown=false; });
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+
+// ---------- Player / RPG ----------
+const hpbar = document.getElementById('hpbar');
+const xpEl = document.getElementById('xp'), xptEl=document.getElementById('xpt'), lvlEl=document.getElementById('lvl');
+const gearEl = document.getElementById('gear'), perksEl=document.getElementById('perks'), inkpctEl=document.getElementById('inkpct');
+const toast = document.getElementById('toast');
+
+const GearTiers = ["Common","Uncommon","Rare","Epic","Legendary"];
+function rollGear(){ const r=Math.random(); return r>0.985?4:r>0.94?3:r>0.75?2:r>0.45?1:0; }
+
+const player = addEnt({
+  team: TEAM_PLAYER,
+  x: W>>1, y:H>>1,
+  vx:0, vy:0,
+  ang:0,
+  speedBase: 2.2,
+  hp: 100, hpMax:100,
+  xp:0, xpTo:100, level:1,
+  ink:100,
+  dashCD:0,
+  perks: {inkEfficiency:0, swimSpeed:0, bombMastery:0},
+  gearTier: 0,
+  update(dt){
+    // Movement influenced by ink underfoot
+    const i = idx(Math.round(this.x), Math.round(this.y));
+    const myInk = inkOwner[i]===TEAM_PLAYER ? Math.max(0, inkAlpha[i]) : 0;
+    const enemyInk = inkOwner[i]===TEAM_ENEMY ? Math.max(0, inkAlpha[i]) : 0;
+    const swimMul = 1 + this.perks.swimSpeed*0.25;
+    const speed = (this.speedBase + myInk*2.0)*swimMul * (enemyInk>0 ? 0.6 : 1);
+
+    let ax=0, ay=0;
+    if(keys['w']) ay-=1;
+    if(keys['s']) ay+=1;
+    if(keys['a']) ax-=1;
+    if(keys['d']) ax+=1;
+    const mag=Math.hypot(ax,ay)||1;
+    this.vx = (ax/mag)*speed;
+    this.vy = (ay/mag)*speed;
+
+    // Dash (swim) uses ink
+    this.dashCD = Math.max(0, this.dashCD-dt);
+    if(keys[' '] && this.ink>10 && this.dashCD<=0 && myInk>0.1){
+      this.ink -= 10;
+      this.vx*=2.5; this.vy*=2.5;
+      this.dashCD=0.5; spraySound();
+    }
+
+    this.x = clamp(this.x+this.vx,1,W-2);
+    this.y = clamp(this.y+this.vy,1,H-2);
+
+    // Aim
+    const dx = mouse.x - this.x, dy = mouse.y - this.y;
+    this.ang = Math.atan2(dy,dx);
+
+    // Sprayer (LMB)
+    if(mouse.down && this.ink>0){
+      const eff=1+this.perks.inkEfficiency*0.35;
+      floodSpray(Math.round(this.x+Math.cos(this.ang)*4), Math.round(this.y+Math.sin(this.ang)*4), 8*eff, TEAM_PLAYER, 7+eff);
+      this.ink = Math.max(0, this.ink - 0.25/eff);
+      if(Math.random()<0.5) spraySound();
+    }
+    // Roller (RMB hold)
+    if(mouse.rdown && this.ink>0){
+      const eff=1+this.perks.inkEfficiency*0.2;
+      const r = 4 + this.perks.swimSpeed; // roller width scales a bit
+      paintCircle(Math.round(this.x), Math.round(this.y), r, TEAM_PLAYER, 0.9);
+      this.ink = Math.max(0, this.ink - 0.2/eff);
+      if(Math.random()<0.15) thud();
+    }
+    // Bomb (Q)
+    if(keys['q'] && this.ink>15){
+      this.ink-=15;
+      addEnt(makeBomb(this.x,this.y,this.ang, TEAM_PLAYER, 12 + this.perks.bombMastery*4));
+      bombSound(); keys['q']=false;
+    }
+    // Perk pick (E) on level up
+    if(keys['e'] && perkChoices.length){
+      applyPerk(pickPerk(perkChoices.shift()));
+      announce("Perk learned!");
+      levelUpSound();
+    }
+    // Palette swap (R)
+    if(keys['r']){ palIndex=(palIndex+1)%palettes.length; announce("Palette swapped"); keys['r']=false; }
+
+    // Regenerate ink if standing in own ink
+    if(myInk>0.2) this.ink = Math.min(100, this.ink + 15*dt);
+    else this.ink = Math.min(100, this.ink + 5*dt);
+
+    // UI
+    hpbar.style.width = (220*(this.hp/this.hpMax))+"px";
+    xpEl.textContent = Math.floor(this.xp);
+    xptEl.textContent = this.xpTo;
+    lvlEl.textContent = this.level;
+    gearEl.textContent = GearTiers[this.gearTier];
+    perksEl.textContent = perkSummary();
+    inkpctEl.textContent = Math.floor(this.ink)+"%";
+  },
+  damage(d){
+    this.hp = Math.max(0, this.hp - d);
+    if(this.hp<=0){ announce("You got splatted! (Reload page)"); }
+  }
+});
+
+// ---------- Perks ----------
+let perkChoices = [];
+function rollPerks(){
+  const pool = [
+    {k:'inkEfficiency', name:'Ink Efficiency +1', apply:()=>player.perks.inkEfficiency++},
+    {k:'swimSpeed', name:'Swim Speed +1', apply:()=>player.perks.swimSpeed++},
+    {k:'bombMastery', name:'Bomb Mastery +1', apply:()=>player.perks.bombMastery++},
+  ];
+  // choose 2 random
+  const picks=[];
+  while(picks.length<2){
+    const p = pool[irand(pool.length-1,0)];
+    if(!picks.includes(p)) picks.push(p);
+  }
+  return picks;
+}
+function applyPerk(p){ p.apply(); }
+function pickPerk(p){ return p; }
+function perkSummary(){
+  const p=player.perks, arr=[];
+  if(p.inkEfficiency) arr.push(`InkEff ${p.inkEfficiency}`);
+  if(p.swimSpeed) arr.push(`Swim ${p.swimSpeed}`);
+  if(p.bombMastery) arr.push(`Bomb ${p.bombMastery}`);
+  return arr.join(', ')||'None';
+}
+function announce(msg){
+  toast.textContent = msg;
+  toast.style.opacity = 1;
+  setTimeout(()=>toast.style.opacity=0, 1200);
+}
+
+// ---------- Bomb ----------
+function makeBomb(x,y,ang, team, power=12){
+  return {
+    team, x, y, vx:Math.cos(ang)*4, vy:Math.sin(ang)*4, t:0, life:0.6,
+    update(dt){
+      this.t+=dt; this.x+=this.vx; this.y+=this.vy;
+      if(this.t>=this.life){
+        paintCircle(Math.round(this.x), Math.round(this.y), power, team, 1.0);
+        // Damage mobs in radius
+        for(const e of ents) if(e.team===TEAM_ENEMY){
+          const d = Math.hypot(e.x-this.x, e.y-this.y);
+          if(d<=power) e.damage?.(25);
+        }
+        this.dead=true;
+      }
+    },
+    draw(g){ g.fillStyle="#fff"; drawBlob(g,this.x*SCALE,this.y*SCALE, 2*SCALE, "#fff"); }
+  };
+}
+
+// ---------- Mobs (paint back) ----------
+function makeMob(){
+  const side = Math.random()<0.5?0:W-1;
+  const x=side, y=irand(H-2,1);
+  return {
+    team: TEAM_ENEMY, x, y, hp:40, cool:0,
+    update(dt){
+      // Wander toward enemy territory to repaint
+      this.cool=Math.max(0,this.cool-dt);
+      const tx = player.x + Math.cos(rand(TAU))*20;
+      const ty = player.y + Math.sin(rand(TAU))*20;
+      const dx = tx-this.x, dy=ty-this.y, d=Math.hypot(dx,dy)||1;
+      const speed = 1.6;
+      this.x = clamp(this.x + dx/d*speed*dt*60, 1, W-2);
+      this.y = clamp(this.y + dy/d*speed*dt*60, 1, H-2);
+      // Paint trail
+      paintCircle(Math.round(this.x),Math.round(this.y),3, TEAM_ENEMY, 0.8);
+      // Bite player if close and on enemy ink
+      const dist = Math.hypot(player.x-this.x, player.y-this.y);
+      const tile = idx(Math.round(this.x),Math.round(this.y));
+      const onEnemyInk = inkOwner[tile]===TEAM_ENEMY && inkAlpha[tile]>0.15;
+      if(dist<6 && this.cool<=0){
+        if(onEnemyInk) player.damage(6);
+        this.cool=0.6;
+      }
+      // Die
+      if(this.hp<=0) {
+        player.xp += 25;
+        if(player.xp>=player.xpTo){ player.level++; player.xp=0; player.xpTo=Math.round(player.xpTo*1.35); perkChoices=rollPerks(); announce("Level up! Press E to pick a perk"); levelUpSound(); }
+        // Drop chance: gear tier upgrade
+        if(Math.random()<0.12){ player.gearTier = Math.min(4, Math.max(player.gearTier, rollGear())); announce("Gear upgraded: "+GearTiers[player.gearTier]); }
+        this.dead=true;
+        thud();
+      }
+    },
+    damage(d){ this.hp-=d; },
+    draw(g){
+      const col = "#ff6b8a";
+      drawBlob(g, this.x*SCALE, this.y*SCALE, 3*SCALE, col);
+      // tiny eye
+      g.fillStyle="#000"; g.fillRect(this.x*SCALE-1, this.y*SCALE-1, 2,2);
+    }
+  };
+}
+
+// ---------- Projectiles (player hits) ----------
+function makeSprayPellet(x,y,ang,team){
+  return {
+    team, x, y, vx:Math.cos(ang)*5, vy:Math.sin(ang)*5, life:0.2, t:0,
+    update(dt){
+      this.t+=dt; this.x+=this.vx; this.y+=this.vy;
+      paintCircle(Math.round(this.x), Math.round(this.y), 1, team, 0.7);
+      if(this.t>=this.life) this.dead=true;
+      // damage enemies lightly
+      for(const e of ents) if(e.team===TEAM_ENEMY){
+        const d=Math.hypot(e.x-this.x,e.y-this.y);
+        if(d<3){ e.damage?.(3); }
+      }
+    },
+    draw(g){ g.fillStyle="#fff"; g.fillRect(this.x*SCALE,this.y*SCALE,1,1); }
+  }
+}
+
+// ---------- Game Setup ----------
+function seedWorld(){
+  // Start with neutral: faint noise to vary cells
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const i=idx(x,y);
+      inkOwner[i]=0; inkAlpha[i]=0;
+    }
+  }
+  // Player spawn ink
+  paintCircle(player.x, player.y, 10, TEAM_PLAYER, 1);
+}
+seedWorld();
+let spawnTimer=0;
+
+// ---------- Main Loop ----------
+let last=now(), paused=false;
+addEventListener('keydown', e=>{
+  if(e.key.toLowerCase()==='p'){ paused=!paused; announce(paused?'Paused':'Resumed'); }
+});
+
+function loop(){
+  const t=now(), dt=Math.min(0.033,(t-last)/1000); last=t;
+  if(!paused){
+    update(dt);
+    draw();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function update(dt){
+  // Continuous spray stream -> spawn pellets if LMB
+  if(mouse.down && Math.random()<0.9){
+    ents.push(makeSprayPellet(player.x,player.y,player.ang,TEAM_PLAYER));
+  }
+  // Spawn mobs based on enemy territory deficit
+  spawnTimer-=dt;
+  const want = 1 - territoryRatio(TEAM_ENEMY);
+  if(spawnTimer<=0){
+    ents.push(makeMob());
+    spawnTimer = lerp(2.2, 0.6, territoryRatio(TEAM_PLAYER));
+  }
+
+  // Update ents
+  for(const e of ents) e.update?.(dt);
+  player.update(dt);
+
+  // Cull dead
+  for(let i=ents.length-1;i>=0;i--) if(ents[i].dead) ents.splice(i,1);
+}
+
+function draw(){
+  // Draw ink field
+  const p=palettes[palIndex], enemyDark="#4a1b2a";
+  const img = ctx.createImageData(W,H);
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const i=idx(x,y);
+      const o=inkOwner[i], a=inkAlpha[i];
+      let r=16,g=18,b=24; // base
+      if(o===TEAM_PLAYER && a>0){
+        // blend toward player ink color
+        const col = hexToRGB(p.ink);
+        const t = clamp(a,0,1);
+        r = Math.round(lerp(r,col.r,t));
+        g = Math.round(lerp(g,col.g,t));
+        b = Math.round(lerp(b,col.b,t));
+      } else if(o===TEAM_ENEMY && a>0){
+        const col = {r:255,g:70,b:110};
+        const t = clamp(a,0,1);
+        r = Math.round(lerp(r,col.r,t));
+        g = Math.round(lerp(g,col.g,t));
+        b = Math.round(lerp(b,col.b,t));
+      }
+      const j=(y*W+x)*4;
+      img.data[j]=r; img.data[j+1]=g; img.data[j+2]=b; img.data[j+3]=255;
+    }
+  }
+  // scale up
+  const off = document.createElement('canvas');
+  off.width=W; off.height=H;
+  off.getContext('2d').putImageData(img,0,0);
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(off,0,0,W*SCALE,H*SCALE);
+
+  // Draw entities
+  const g=ctx;
+  // Player
+  const pcol = palettes[palIndex];
+  drawBlob(g, player.x*SCALE, player.y*SCALE, 3.5*SCALE, pcol.roller);
+  // Facing marker
+  g.fillStyle="#000"; g.fillRect(player.x*SCALE+Math.cos(player.ang)*4, player.y*SCALE+Math.sin(player.ang)*4, 2,2);
+
+  for(const e of ents) e.draw?.(g);
+}
+
+// ---------- Helpers ----------
+function hexToRGB(h){
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);
+  return m ? {r:parseInt(m[1],16), g:parseInt(m[2],16), b:parseInt(m[3],16)} : {r:255,g:255,b:255};
+}
+
+// Unlock audio on first interaction (mobile safety)
+addEventListener('pointerdown',()=>{ if(AC.state!=='running') AC.resume(); },{once:true});
+
+// Initial tip
+announce("Paint the map. Press E on level up to pick a perk.");
+</script>
+</body>
+</html>
